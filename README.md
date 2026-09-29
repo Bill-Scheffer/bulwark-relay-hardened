@@ -16,9 +16,15 @@ patch adds three things:
    and WNS (`*.notify.windows.com`); `WEBPUSH_ALLOWED_HOSTS` overrides the list. Upstream accepts any
    `https` URL. A caller could register their own URL, then POST to `/api/push/jmap/<their id>` and
    make the relay send a request to it. That is server-side request forgery from the relay's network.
-2. **A ceiling on stored subscriptions** (`MAX_SUBSCRIPTIONS`, default 10000). Past it, new ids get
-   503, and existing ids can still re-register. Upstream rewrites its whole JSON store on every
-   change and has no limit, so registrations alone could grow it until the relay stalls.
+2. **Unconfirmed subscriptions are capped and expire.** A subscription is *pending* until the JMAP
+   server first reaches it (its verification, or a push). Pending ones expire after the 10-minute
+   verification window, and at most `MAX_PENDING` (default 1000) exist at once: past that, new ids get
+   503. Upstream rewrites its whole JSON store on every change and has no limit, so registrations
+   alone could grow it until the relay stalls. A flat cap would only trade that for a lockout,
+   because anyone could fill it. With this rule a flood can delay new sign-ups while it lasts, but
+   never evicts or blocks a confirmed subscription. ⚠️ **It holds only if nothing but your own mail
+   server can reach `/api/push/jmap/`**, because anything that can post there can confirm an id. Our
+   deployment restricts that path at the proxy to the mail server's addresses.
 3. **UnifiedPush is off unless `UNIFIEDPUSH_ENABLED=true`.** Its endpoints are arbitrary `https`
    URLs by design, which is the same forgery risk as 1.
 
@@ -30,7 +36,8 @@ The workflow runs these steps, and pushes the image only if all of them pass:
 - It runs upstream's tests plus the patch's, and the typecheck.
 - It builds the image and runs `scripts/e2e.sh` against it. That script registers a push-service
   endpoint (accepted), an arbitrary URL and a look-alike host (both refused), UnifiedPush (refused),
-  and ids past a cap of 2 (503). It also checks a verification round trip.
+  and a third pending id past a cap of 2 (503). It checks a verification round trip, and that
+  a confirmed id no longer counts against the cap. Expiry is covered by a unit test.
 - **Negative control:** the unpatched upstream image, built from the same commit, must accept every
   one of the refused cases. So each check can actually fail.
 

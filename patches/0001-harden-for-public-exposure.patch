@@ -1,15 +1,19 @@
 diff --git a/src/server.ts b/src/server.ts
-index 1524fa6..deea0ff 100644
+index 1524fa6..58367c8 100644
 --- a/src/server.ts
 +++ b/src/server.ts
-@@ -38,6 +38,14 @@ import {
+@@ -38,6 +38,18 @@ import {
  const PORT = Number(process.env.PORT ?? 3003);
  const HOST = process.env.HOST ?? '0.0.0.0';
  const MAX_BODY_BYTES = 64 * 1024;
 +// Registration is unauthenticated and the whole store is rewritten on every
-+// change, so without a ceiling anyone can grow it until the relay stalls.
-+// New ids are refused past it; existing ones can still re-register.
-+const MAX_SUBSCRIPTIONS = Number(process.env.MAX_SUBSCRIPTIONS ?? 10000);
++// change. So a subscription the JMAP server has never reached (pending) lives
++// only for the verification window, and pending ones are capped: past the cap
++// new ids are refused. A flood can then delay new sign-ups while it lasts, but
++// never evicts or blocks a subscription a mail server has confirmed. This holds
++// only if the operator lets nothing but its own mail server reach
++// /api/push/jmap/, since whatever can post there can confirm an id.
++const MAX_PENDING = Number(process.env.MAX_PENDING ?? 1000);
 +// UnifiedPush endpoints are arbitrary https URLs by design (the user picks a
 +// distributor), so the relay would POST wherever a caller registered. Off
 +// unless the operator opts in.
@@ -17,18 +21,18 @@ index 1524fa6..deea0ff 100644
  const REPO_URL = 'https://github.com/bulwarkmail/relay';
  
  // How long after registration we still report a subscription as "active" even
-@@ -118,6 +126,10 @@ function applyCors(req: http.IncomingMessage, res: http.ServerResponse): void {
+@@ -118,6 +130,10 @@ function applyCors(req: http.IncomingMessage, res: http.ServerResponse): void {
    }
  }
  
 +async function atCapacity(existing: SubscriptionRecord | null): Promise<boolean> {
-+  return !existing && (await subscriptionStore.size()) >= MAX_SUBSCRIPTIONS;
++  return !existing && (await subscriptionStore.prunePending(ACTIVE_GRACE_MS)) >= MAX_PENDING;
 +}
 +
  function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
    const payload = JSON.stringify(body);
    res.writeHead(status, {
-@@ -148,6 +160,9 @@ async function handleRegister(
+@@ -148,6 +164,9 @@ async function handleRegister(
    }
  
    const existing = await subscriptionStore.get(subscriptionId);
@@ -38,7 +42,15 @@ index 1524fa6..deea0ff 100644
    const record: FcmSubscriptionRecord = {
      kind: 'fcm',
      fcmToken,
-@@ -198,6 +213,9 @@ async function handleRegisterWeb(
+@@ -160,6 +179,7 @@ async function handleRegister(
+     verificationCode: null,
+     createdAt: existing?.createdAt ?? Date.now(),
+     lastPushAt: existing?.lastPushAt ?? null,
++    jmapSeenAt: existing?.jmapSeenAt ?? null,
+     accountLabel:
+       typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
+   };
+@@ -198,6 +218,9 @@ async function handleRegisterWeb(
    }
  
    const existing = await subscriptionStore.get(subscriptionId);
@@ -48,7 +60,15 @@ index 1524fa6..deea0ff 100644
    const record: WebSubscriptionRecord = {
      kind: 'web',
      webPush: subscription,
-@@ -221,6 +239,9 @@ async function handleRegisterUnifiedPush(
+@@ -205,6 +228,7 @@ async function handleRegisterWeb(
+     verificationCode: null,
+     createdAt: existing?.createdAt ?? Date.now(),
+     lastPushAt: existing?.lastPushAt ?? null,
++    jmapSeenAt: existing?.jmapSeenAt ?? null,
+     accountLabel:
+       typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
+   };
+@@ -221,6 +245,9 @@ async function handleRegisterUnifiedPush(
    req: http.IncomingMessage,
    res: http.ServerResponse,
  ): Promise<void> {
@@ -58,7 +78,7 @@ index 1524fa6..deea0ff 100644
    const body = (await readJson(req)) as
      | {
          subscriptionId?: unknown;
-@@ -245,6 +266,9 @@ async function handleRegisterUnifiedPush(
+@@ -245,6 +272,9 @@ async function handleRegisterUnifiedPush(
    }
  
    const existing = await subscriptionStore.get(subscriptionId);
@@ -68,6 +88,119 @@ index 1524fa6..deea0ff 100644
    const record: UnifiedPushSubscriptionRecord = {
      kind: 'up',
      endpoint,
+@@ -253,6 +283,7 @@ async function handleRegisterUnifiedPush(
+     verificationCode: null,
+     createdAt: existing?.createdAt ?? Date.now(),
+     lastPushAt: existing?.lastPushAt ?? null,
++    jmapSeenAt: existing?.jmapSeenAt ?? null,
+     accountLabel:
+       typeof accountLabel === 'string' ? accountLabel.slice(0, 120) : undefined,
+   };
+@@ -342,6 +373,7 @@ async function handleJmap(
+   if (body['@type'] === 'PushVerification') {
+     pushesReceived.inc({ type: 'PushVerification' });
+     record.verificationCode = body.verificationCode;
++    record.jmapSeenAt ??= Date.now();
+     await subscriptionStore.put(id, record);
+     return sendJson(res, 200, { ok: true });
+   }
+@@ -360,6 +392,7 @@ async function handleJmap(
+     else outcome = 'fail';
+     pushesForwarded.inc({ result: outcome, transport: record.kind });
+     record.lastPushAt = Date.now();
++    record.jmapSeenAt ??= record.lastPushAt;
+     await subscriptionStore.put(id, record);
+     if (result.unregistered) {
+       await subscriptionStore.delete(id);
+diff --git a/src/store.test.ts b/src/store.test.ts
+new file mode 100644
+index 0000000..2306d4c
+--- /dev/null
++++ b/src/store.test.ts
+@@ -0,0 +1,35 @@
++import assert from 'node:assert/strict';
++import { mkdtempSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++import { describe, it } from 'node:test';
++
++process.env.PUSH_DATA_DIR = mkdtempSync(path.join(tmpdir(), 'relay-store-'));
++const { subscriptionStore } = await import('./store.js');
++
++const keys = { p256dh: 'B'.repeat(87), auth: 'a'.repeat(22) };
++function web(createdAt: number, jmapSeenAt: number | null) {
++  return {
++    kind: 'web' as const,
++    webPush: { endpoint: 'https://fcm.googleapis.com/fcm/send/x', keys },
++    verificationCode: null,
++    createdAt,
++    lastPushAt: null,
++    jmapSeenAt,
++  };
++}
++
++describe('prunePending', () => {
++  it('drops stale pending records, keeps fresh pending and every confirmed one', async () => {
++    const now = Date.now();
++    const hour = 60 * 60 * 1000;
++    await subscriptionStore.put('stale-pending', web(now - hour, null));
++    await subscriptionStore.put('fresh-pending', web(now - 1000, null));
++    await subscriptionStore.put('old-confirmed', web(now - 30 * 24 * hour, now - 29 * 24 * hour));
++
++    assert.equal(await subscriptionStore.prunePending(10 * 60 * 1000), 1);
++    assert.equal(await subscriptionStore.get('stale-pending'), null);
++    assert.notEqual(await subscriptionStore.get('fresh-pending'), null);
++    assert.notEqual(await subscriptionStore.get('old-confirmed'), null);
++  });
++});
+diff --git a/src/store.ts b/src/store.ts
+index 66baab3..7a0e05b 100644
+--- a/src/store.ts
++++ b/src/store.ts
+@@ -76,6 +76,28 @@ class SubscriptionStore {
+     }
+   }
+ 
++  /**
++   * Drops pending records (never reached by the JMAP server) older than
++   * maxAgeMs, and returns how many pending records remain.
++   */
++  async prunePending(maxAgeMs: number): Promise<number> {
++    await this.ensureLoaded();
++    const now = Date.now();
++    let pending = 0;
++    let evicted = false;
++    for (const [id, record] of Object.entries(this.cache)) {
++      if (record.jmapSeenAt != null) continue;
++      if (now - record.createdAt > maxAgeMs) {
++        delete this.cache[id];
++        evicted = true;
++      } else {
++        pending++;
++      }
++    }
++    if (evicted) await this.persist();
++    return pending;
++  }
++
+   async size(): Promise<number> {
+     await this.ensureLoaded();
+     return Object.keys(this.cache).length;
+diff --git a/src/types.ts b/src/types.ts
+index 6c5fc17..04bcaa8 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -11,6 +11,10 @@ interface BaseSubscriptionRecord {
+   verificationCode: string | null;
+   createdAt: number;
+   lastPushAt: number | null;
++  // When the JMAP server first reached this subscription (a PushVerification or
++  // a push). Null means pending: registered by a caller, never confirmed by a
++  // mail server. Kept across re-registration.
++  jmapSeenAt?: number | null;
+   accountLabel?: string;
+ }
+ 
 diff --git a/src/validation.test.ts b/src/validation.test.ts
 index 7953b88..b2d6207 100644
 --- a/src/validation.test.ts

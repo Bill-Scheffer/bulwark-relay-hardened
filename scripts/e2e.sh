@@ -42,21 +42,23 @@ web() { # id endpoint
 }
 
 echo "== patched: $IMAGE"
-start e2e-relay "$IMAGE" -e MAX_SUBSCRIPTIONS=2
+start e2e-relay "$IMAGE" -e MAX_PENDING=2
 expect "vapid key served"              "200"  "$(call e2e-relay GET /api/push/vapid-public-key)"
 expect "a push-service endpoint"       "200"  "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-A1 https://fcm.googleapis.com/fcm/send/abc)")"
 expect "an arbitrary endpoint (SSRF)"  "400"  "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-X1 https://attacker.example/collect)")"
 expect "a look-alike host"             "400"  "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-X2 https://fcm.googleapis.com.attacker.example/x)")"
 expect "UnifiedPush, not opted in"     "403"  "$(call e2e-relay POST /api/push/register/unifiedpush '{"subscriptionId":"e2e-sub-U1","endpoint":"https://attacker.example/up"}')"
-expect "second id (at the cap of 2)"   "200"  "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-B1 https://updates.push.services.mozilla.com/wpush/v2/x)")"
-expect "third id, past the cap"        "503"  "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-C1 https://web.push.apple.com/x)")"
+expect "second pending id (cap of 2)"  "200"  "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-B1 https://updates.push.services.mozilla.com/wpush/v2/x)")"
+expect "third pending id, past the cap" "503" "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-C1 https://web.push.apple.com/x)")"
 expect "an existing id re-registers"   "200"  "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-A1 https://fcm.googleapis.com/fcm/send/abc)")"
 expect "PushVerification accepted"     "200"  "$(call e2e-relay POST /api/push/jmap/e2e-sub-A1 '{"@type":"PushVerification","pushSubscriptionId":"p","verificationCode":"e2e-code-7"}')"
 expect "verify returns the code"       '200 {"verificationCode":"e2e-code-7"}' "$(call e2e-relay GET /api/push/verify/e2e-sub-A1)"
+expect "confirmed ids leave the cap"   "200"  "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-C1 https://web.push.apple.com/x)")"
 
 echo "== negative control, upstream unpatched: $UPSTREAM"
-start e2e-upstream "$UPSTREAM" -e MAX_SUBSCRIPTIONS=2
+start e2e-upstream "$UPSTREAM" -e MAX_PENDING=2
 expect "control: arbitrary endpoint accepted" "200" "$(call e2e-upstream POST /api/push/register/web "$(web e2e-sub-X1 https://attacker.example/collect)")"
 expect "control: UnifiedPush accepted"        "200" "$(call e2e-upstream POST /api/push/register/unifiedpush '{"subscriptionId":"e2e-sub-U1","endpoint":"https://attacker.example/up"}')"
-expect "control: no cap"                      "200" "$(call e2e-upstream POST /api/push/register/web "$(web e2e-sub-C1 https://web.push.apple.com/x)")"
+expect "control: no cap (id 2)"               "200" "$(call e2e-upstream POST /api/push/register/web "$(web e2e-sub-B1 https://updates.push.services.mozilla.com/wpush/v2/x)")"
+expect "control: no cap (id 3)"               "200" "$(call e2e-upstream POST /api/push/register/web "$(web e2e-sub-C1 https://web.push.apple.com/x)")"
 echo "e2e: OK"
