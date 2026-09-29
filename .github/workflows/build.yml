@@ -1,0 +1,117 @@
+# Builds the Bulwark push relay from its upstream source, pinned by commit, with ONE change,
+# patches/0001-harden-for-public-exposure.patch: Web Push endpoints must be on a known push service
+# (without it the relay can be made to POST to any https URL), a ceiling on stored subscriptions,
+# and UnifiedPush off unless opted in. Everything else is upstream, including its Dockerfile. The
+# image is pushed only after an end-to-end check against the built image passes, with the unpatched
+# upstream image as the negative control.
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/build.yml", "patches/**", "scripts/**"]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  # Upstream publishes no tags or releases, so the pin is a commit on main: immutable, unlike a branch.
+  RELAY_SHA: d4f34c04396c920a1cded5443e7361a4d94d3010
+  IMAGE: ghcr.io/bill-scheffer/bulwark-relay-hardened
+  VERSION: 0.1.0-d4f34c0-h1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          path: patch
+
+      - name: Check out the relay at the pinned commit (patched)
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          repository: bulwarkmail/relay
+          ref: ${{ env.RELAY_SHA }}
+          path: relay
+
+      - name: Check out the relay at the pinned commit (upstream, the negative control)
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          repository: bulwarkmail/relay
+          ref: ${{ env.RELAY_SHA }}
+          path: upstream
+
+      - name: Apply the patch, and prove it changed exactly its three files
+        working-directory: relay
+        run: |
+          set -eu
+          git apply --check ../patch/patches/0001-harden-for-public-exposure.patch
+          git apply ../patch/patches/0001-harden-for-public-exposure.patch
+          got=$(git status --porcelain | LC_ALL=C sort | tr '\n' '|')
+          want=$(printf '%s\n' ' M src/server.ts' ' M src/validation.test.ts' ' M src/validation.ts' | LC_ALL=C sort | tr '\n' '|')
+          [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
+        with:
+          node-version: "22"
+
+      - name: Upstream's tests plus the patch's, and the typecheck
+        working-directory: relay
+        run: |
+          set -eu
+          npm ci --no-audit --no-fund
+          npx tsx --test src/*.test.ts
+          npx tsc --noEmit
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+
+      - name: Build with the relay's own Dockerfile (loaded locally, not pushed yet)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: relay
+          file: relay/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.description=Bulwark push relay @ ${{ env.RELAY_SHA }}, hardened for public exposure
+            org.opencontainers.image.licenses=AGPL-3.0-only
+
+      - name: Build upstream unpatched, for the negative control only (never pushed)
+        run: docker build -q -t relay-upstream:control upstream
+
+      - name: End-to-end against the built image
+        run: bash patch/scripts/e2e.sh "${IMAGE}:${VERSION}" relay-upstream:control
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push, only after the end-to-end check passed
+        run: |
+          set -eu
+          docker push "${IMAGE}:${VERSION}"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${VERSION}")
+          echo "pushed ${digest}"
+          {
+            echo "### ${IMAGE}"
+            echo "- tag: \`${VERSION}\`"
+            echo "- digest: \`${digest#*@}\`"
+            echo "- relay: \`bulwarkmail/relay\` @ \`${RELAY_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

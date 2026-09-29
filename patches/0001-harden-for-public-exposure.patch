@@ -1,0 +1,191 @@
+diff --git a/src/server.ts b/src/server.ts
+index 1524fa6..deea0ff 100644
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -38,6 +38,14 @@ import {
+ const PORT = Number(process.env.PORT ?? 3003);
+ const HOST = process.env.HOST ?? '0.0.0.0';
+ const MAX_BODY_BYTES = 64 * 1024;
++// Registration is unauthenticated and the whole store is rewritten on every
++// change, so without a ceiling anyone can grow it until the relay stalls.
++// New ids are refused past it; existing ones can still re-register.
++const MAX_SUBSCRIPTIONS = Number(process.env.MAX_SUBSCRIPTIONS ?? 10000);
++// UnifiedPush endpoints are arbitrary https URLs by design (the user picks a
++// distributor), so the relay would POST wherever a caller registered. Off
++// unless the operator opts in.
++const UNIFIEDPUSH_ENABLED = process.env.UNIFIEDPUSH_ENABLED === 'true';
+ const REPO_URL = 'https://github.com/bulwarkmail/relay';
+ 
+ // How long after registration we still report a subscription as "active" even
+@@ -118,6 +126,10 @@ function applyCors(req: http.IncomingMessage, res: http.ServerResponse): void {
+   }
+ }
+ 
++async function atCapacity(existing: SubscriptionRecord | null): Promise<boolean> {
++  return !existing && (await subscriptionStore.size()) >= MAX_SUBSCRIPTIONS;
++}
++
+ function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
+   const payload = JSON.stringify(body);
+   res.writeHead(status, {
+@@ -148,6 +160,9 @@ async function handleRegister(
+   }
+ 
+   const existing = await subscriptionStore.get(subscriptionId);
++  if (await atCapacity(existing)) {
++    return sendJson(res, 503, { error: 'Subscription limit reached' });
++  }
+   const record: FcmSubscriptionRecord = {
+     kind: 'fcm',
+     fcmToken,
+@@ -198,6 +213,9 @@ async function handleRegisterWeb(
+   }
+ 
+   const existing = await subscriptionStore.get(subscriptionId);
++  if (await atCapacity(existing)) {
++    return sendJson(res, 503, { error: 'Subscription limit reached' });
++  }
+   const record: WebSubscriptionRecord = {
+     kind: 'web',
+     webPush: subscription,
+@@ -221,6 +239,9 @@ async function handleRegisterUnifiedPush(
+   req: http.IncomingMessage,
+   res: http.ServerResponse,
+ ): Promise<void> {
++  if (!UNIFIEDPUSH_ENABLED) {
++    return sendJson(res, 403, { error: 'UnifiedPush is not enabled on this relay' });
++  }
+   const body = (await readJson(req)) as
+     | {
+         subscriptionId?: unknown;
+@@ -245,6 +266,9 @@ async function handleRegisterUnifiedPush(
+   }
+ 
+   const existing = await subscriptionStore.get(subscriptionId);
++  if (await atCapacity(existing)) {
++    return sendJson(res, 503, { error: 'Subscription limit reached' });
++  }
+   const record: UnifiedPushSubscriptionRecord = {
+     kind: 'up',
+     endpoint,
+diff --git a/src/validation.test.ts b/src/validation.test.ts
+index 7953b88..b2d6207 100644
+--- a/src/validation.test.ts
++++ b/src/validation.test.ts
+@@ -1,10 +1,54 @@
+ import assert from 'node:assert/strict';
+ import { describe, it } from 'node:test';
+ import {
++  isAllowedWebPushEndpoint,
+   isValidUnifiedPushEndpoint,
+   isValidUnifiedPushKeys,
++  isValidWebPushSubscription,
+ } from './validation.js';
+ 
++describe('isAllowedWebPushEndpoint', () => {
++  it('accepts the browser push services', () => {
++    for (const url of [
++      'https://fcm.googleapis.com/fcm/send/abc123',
++      'https://updates.push.services.mozilla.com/wpush/v2/gAAAA',
++      'https://web.push.apple.com/QK0rA1b2',
++      'https://wns2-par02p.notify.windows.com/w/?token=AQE',
++      'https://FCM.GoogleAPIs.com/fcm/send/x',
++    ]) {
++      assert.equal(isAllowedWebPushEndpoint(url), true, url);
++    }
++  });
++
++  it('refuses anything else, including look-alikes and internal targets', () => {
++    for (const url of [
++      'https://attacker.example/x',
++      'https://fcm.googleapis.com.attacker.example/x',
++      'https://evilfcm.googleapis.com/x',
++      'https://notify.windows.com/x',
++      'https://evil-notify.windows.com.example/x',
++      'https://fcm.googleapis.com:8443/x',
++      'http://fcm.googleapis.com/x',
++      'https://10.0.0.1/x',
++      'https://kubernetes.default.svc/x',
++      'not a url',
++    ]) {
++      assert.equal(isAllowedWebPushEndpoint(url), false, url);
++    }
++  });
++
++  it('honours an explicit allowlist', () => {
++    assert.equal(isAllowedWebPushEndpoint('https://push.example/x', ['push.example']), true);
++    assert.equal(isAllowedWebPushEndpoint('https://fcm.googleapis.com/x', ['push.example']), false);
++  });
++
++  it('gates whole subscriptions', () => {
++    const keys = { p256dh: 'B'.repeat(87), auth: 'a'.repeat(22) };
++    assert.equal(isValidWebPushSubscription({ endpoint: 'https://fcm.googleapis.com/fcm/send/abc', keys }), true);
++    assert.equal(isValidWebPushSubscription({ endpoint: 'https://attacker.example/abc', keys }), false);
++  });
++});
++
+ describe('isValidUnifiedPushEndpoint', () => {
+   it('accepts an https distributor endpoint', () => {
+     assert.equal(isValidUnifiedPushEndpoint('https://ntfy.sh/upA1b2C3d4?up=1'), true);
+diff --git a/src/validation.ts b/src/validation.ts
+index 68becaa..3c0fb87 100644
+--- a/src/validation.ts
++++ b/src/validation.ts
+@@ -41,15 +41,55 @@ export function isValidUnifiedPushKeys(
+   return true;
+ }
+ 
++// The push services browsers subscribe through: Chrome/Android and most
++// Chromium browsers (FCM), Firefox (Mozilla autopush), Safari and iOS
++// (Apple), Edge (WNS). A leading "." matches any subdomain. Overridable with
++// WEBPUSH_ALLOWED_HOSTS (comma-separated, same syntax).
++export const DEFAULT_WEBPUSH_HOSTS = [
++  'fcm.googleapis.com',
++  'updates.push.services.mozilla.com',
++  'web.push.apple.com',
++  '.notify.windows.com',
++];
++
++function allowedWebPushHosts(): string[] {
++  const configured = process.env.WEBPUSH_ALLOWED_HOSTS?.split(',')
++    .map((h) => h.trim().toLowerCase())
++    .filter(Boolean);
++  return configured?.length ? configured : DEFAULT_WEBPUSH_HOSTS;
++}
++
++// Without this, anyone can register an arbitrary https URL as their "push
++// service" and then, by POSTing to /api/push/jmap/:id with their own id, make
++// the relay send a request to it: server-side request forgery, from the
++// relay's network. Only endpoints on a known push service are accepted.
++export function isAllowedWebPushEndpoint(
++  endpoint: string,
++  allowed: string[] = allowedWebPushHosts(),
++): boolean {
++  let host: string;
++  try {
++    const url = new URL(endpoint);
++    if (url.protocol !== 'https:' || url.port !== '') return false;
++    host = url.hostname.toLowerCase();
++  } catch {
++    return false;
++  }
++  return allowed.some((entry) =>
++    entry.startsWith('.') ? host.endsWith(entry) && host.length > entry.length : host === entry,
++  );
++}
++
+ // Browser PushSubscription endpoints come from the major push services
+ // (FCM, Mozilla autopush, Apple, WindowsNotificationServices). Allow only
+-// https URLs and cap the length so a malicious caller can't bloat the store.
++// https URLs on those services and cap the length so a malicious caller
++// can't bloat the store.
+ export function isValidWebPushSubscription(value: unknown): value is WebPushSubscription {
+   if (!value || typeof value !== 'object') return false;
+   const v = value as Record<string, unknown>;
+   if (typeof v.endpoint !== 'string') return false;
+   if (v.endpoint.length < 10 || v.endpoint.length > 2048) return false;
+-  if (!/^https:\/\//i.test(v.endpoint)) return false;
++  if (!isAllowedWebPushEndpoint(v.endpoint)) return false;
+   if (!v.keys || typeof v.keys !== 'object') return false;
+   const keys = v.keys as Record<string, unknown>;
+   if (typeof keys.p256dh !== 'string' || keys.p256dh.length < 64 || keys.p256dh.length > 256) {
