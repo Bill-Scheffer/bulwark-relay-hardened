@@ -32,7 +32,7 @@ patch adds three things:
 
 The workflow runs these steps, and pushes the image only if all of them pass:
 
-- It applies the patch and checks it changed exactly its three files.
+- It applies the patch and checks it changed exactly its six files.
 - It runs upstream's tests plus the patch's, and the typecheck.
 - It builds the image and runs `scripts/e2e.sh` against it. That script registers a push-service
   endpoint (accepted), an arbitrary URL and a look-alike host (both refused), UnifiedPush (refused),
