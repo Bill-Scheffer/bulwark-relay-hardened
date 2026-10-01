@@ -1,0 +1,189 @@
+diff --git a/src/dedupe.test.ts b/src/dedupe.test.ts
+new file mode 100644
+index 0000000..5804bc9
+--- /dev/null
++++ b/src/dedupe.test.ts
+@@ -0,0 +1,59 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { RecentPushes, pushKey } from './dedupe.js';
++
++const email = (ids: string[], accountId = 'a'): Parameters<typeof pushKey>[1] => ({
++  '@type': 'EmailPush',
++  accountId,
++  emails: ids.map((id) => ({ id, threadId: 't' })),
++  state: 's1',
++});
++
++test('the same EmailPush from two nodes has one key; id order and state do not matter', () => {
++  const a = pushKey('sub', email(['m1', 'm2']));
++  const b = pushKey('sub', { ...email(['m2', 'm1']), state: 's2' } as Parameters<typeof pushKey>[1]);
++  assert.ok(a);
++  assert.equal(a, b);
++});
++
++test('a different message, account or subscription is a different push', () => {
++  const base = pushKey('sub', email(['m1']));
++  assert.notEqual(base, pushKey('sub', email(['m2'])));
++  assert.notEqual(base, pushKey('sub', email(['m1'], 'b')));
++  assert.notEqual(base, pushKey('other', email(['m1'])));
++});
++
++test('an EmailPush with no ids has no key, so it is always forwarded', () => {
++  assert.equal(pushKey('sub', email([])), null);
++});
++
++test('StateChange: same states are one key whatever the key order; a new state is not', () => {
++  const a = pushKey('sub', { '@type': 'StateChange', changed: { x: { Email: '1', Mailbox: '2' }, y: { Email: '3' } } });
++  const b = pushKey('sub', { '@type': 'StateChange', changed: { y: { Email: '3' }, x: { Mailbox: '2', Email: '1' } } });
++  const c = pushKey('sub', { '@type': 'StateChange', changed: { x: { Email: '9', Mailbox: '2' }, y: { Email: '3' } } });
++  assert.equal(a, b);
++  assert.notEqual(a, c);
++});
++
++test('the first copy is claimed, a repeat inside the TTL is not, and it is claimable again after', () => {
++  const r = new RecentPushes(1000, 100);
++  assert.equal(r.claim('k', 0), true);
++  assert.equal(r.claim('k', 999), false);
++  assert.equal(r.claim('k', 1000), true);
++});
++
++test('release after a failed forward lets the next copy through', () => {
++  const r = new RecentPushes(1000, 100);
++  assert.equal(r.claim('k', 0), true);
++  r.release('k');
++  assert.equal(r.claim('k', 1), true);
++});
++
++test('past the cap the oldest key is dropped first', () => {
++  const r = new RecentPushes(1000, 2);
++  r.claim('a', 0);
++  r.claim('b', 1);
++  r.claim('c', 2);
++  assert.equal(r.claim('a', 3), true, 'a was evicted');
++  assert.equal(r.claim('c', 4), false, 'c is still held');
++});
+diff --git a/src/dedupe.ts b/src/dedupe.ts
+new file mode 100644
+index 0000000..39b66b9
+--- /dev/null
++++ b/src/dedupe.ts
+@@ -0,0 +1,64 @@
++import type { EmailPush, StateChange } from './types.js';
++
++// A mail server running as a cluster pushes the same delivery once from EVERY
++// node: Stalwart gives each node with the push role every subscription unless
++// push sharding is configured, and sharding means an account gets no push while
++// its node is down. So the relay forwards a push once and drops the identical
++// copies. EmailPush copies list the same message ids; StateChange copies carry
++// the same states. Nothing else is compared, so a new message always goes out.
++const TTL_MS = Number(process.env.DEDUPE_TTL_MS ?? 10 * 60 * 1000);
++const MAX_KEYS = Number(process.env.DEDUPE_MAX_KEYS ?? 10_000);
++
++// What makes two pushes the same push, for one subscription. Null: nothing to
++// compare (an EmailPush with no ids), so it is always forwarded.
++export function pushKey(subscriptionId: string, body: StateChange | EmailPush): string | null {
++  if (body['@type'] === 'EmailPush') {
++    const ids = (Array.isArray(body.emails) ? body.emails : [])
++      .map((email) => (email && typeof email.id === 'string' ? email.id : null))
++      .filter((id): id is string => id !== null)
++      .sort();
++    return ids.length > 0 ? JSON.stringify([subscriptionId, 'E', body.accountId, ids]) : null;
++  }
++  const changed = body.changed && typeof body.changed === 'object' ? body.changed : {};
++  const states = Object.keys(changed)
++    .sort()
++    .map((account) => {
++      const types = changed[account] && typeof changed[account] === 'object' ? changed[account] : {};
++      return [account, Object.keys(types).sort().map((type) => [type, types[type]])];
++    });
++  return JSON.stringify([subscriptionId, 'S', states]);
++}
++
++export class RecentPushes {
++  private readonly expiry = new Map<string, number>();
++
++  constructor(
++    private readonly ttlMs = TTL_MS,
++    private readonly maxKeys = MAX_KEYS,
++  ) {}
++
++  // True for the first copy, false for a copy seen within the TTL. Synchronous
++  // on purpose: the copies arrive milliseconds apart, and no await may sit
++  // between the check and the set, or both would pass.
++  claim(key: string, now = Date.now()): boolean {
++    const expires = this.expiry.get(key);
++    if (expires !== undefined && expires > now) return false;
++    this.expiry.delete(key);
++    this.expiry.set(key, now + this.ttlMs);
++    // Insertion order is age order: drop the oldest past the cap.
++    while (this.expiry.size > this.maxKeys) {
++      this.expiry.delete(this.expiry.keys().next().value as string);
++    }
++    return true;
++  }
++
++  // The forward failed, so the next copy must go through instead of being
++  // dropped as a repeat. A copy that arrived while the failed forward was in
++  // flight was already dropped; the server's retry of the failed push (its
++  // pushAttemptWait later) is that next copy, so the push is late, not lost.
++  release(key: string): void {
++    this.expiry.delete(key);
++  }
++}
++
++export const recentPushes = new RecentPushes();
+diff --git a/src/metrics.ts b/src/metrics.ts
+index 24aa548..78fe9ce 100644
+--- a/src/metrics.ts
++++ b/src/metrics.ts
+@@ -52,6 +52,13 @@ export const pushesReceived = new Counter({
+   registers: [registry],
+ });
+ 
++export const pushesDeduplicated = new Counter({
++  name: 'relay_pushes_deduplicated_total',
++  help: 'Identical JMAP pushes dropped as copies of one already forwarded (one per extra cluster node)',
++  labelNames: ['type'] as const,
++  registers: [registry],
++});
++
+ export const pushesForwarded = new Counter({
+   name: 'relay_pushes_forwarded_total',
+   help: 'Push forwarding outcomes by transport',
+diff --git a/src/server.ts b/src/server.ts
+index 58367c8..401d362 100644
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -6,6 +6,7 @@ import { sendFcmPush } from './fcm.js';
+ import { getVapidPublicKey, sendWebPush } from './webpush.js';
+ import { sendUnifiedPush } from './unifiedpush.js';
+ import { isForwardableBody, toForwardPayload } from './payload.js';
++import { pushKey, recentPushes } from './dedupe.js';
+ import {
+   isValidFcmToken,
+   isValidSubscriptionId,
+@@ -30,6 +31,7 @@ import {
+   subscriptionsActive,
+   pushesReceived,
+   pushesForwarded,
++  pushesDeduplicated,
+   fcmDurationSeconds,
+   webPushDurationSeconds,
+   upDurationSeconds,
+@@ -383,7 +385,15 @@ async function handleJmap(
+   // messages that passed - both become the same content-blind device payload.
+   if (isForwardableBody(body)) {
+     pushesReceived.inc({ type: body['@type'] });
++    // Every node of a clustered mail server sends this same push (dedupe.ts).
++    // Answer the copies 200 so the server does not retry them.
++    const key = pushKey(id, body);
++    if (key !== null && !recentPushes.claim(key)) {
++      pushesDeduplicated.inc({ type: body['@type'] });
++      return sendJson(res, 200, { ok: true, duplicate: true });
++    }
+     const result = await dispatch(record, toForwardPayload(body, record.accountLabel));
++    if (!result.ok && key !== null) recentPushes.release(key);
+     let outcome: 'ok' | 'unregistered' | 'http-4xx' | 'http-5xx' | 'fail';
+     if (result.unregistered) outcome = 'unregistered';
+     else if (result.ok) outcome = 'ok';

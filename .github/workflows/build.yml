@@ -1,7 +1,9 @@
-# Builds the Bulwark push relay from its upstream source, pinned by commit, with ONE change,
+# Builds the Bulwark push relay from its upstream source, pinned by commit, with TWO changes.
 # patches/0001-harden-for-public-exposure.patch: Web Push endpoints must be on a known push service
 # (without it the relay can be made to POST to any https URL), unconfirmed subscriptions capped and
-# expired so registrations cannot fill the store, and UnifiedPush off unless opted in. Everything else is upstream, including its Dockerfile. The
+# expired so registrations cannot fill the store, and UnifiedPush off unless opted in.
+# patches/0002-dedupe-cluster-pushes.patch: a clustered mail server sends each push from every node,
+# so the relay forwards one and drops the identical copies. Everything else is upstream, including its Dockerfile. The
 # image is pushed only after an end-to-end check against the built image passes, with the unpatched
 # upstream image as the negative control.
 name: build
@@ -24,7 +26,7 @@ env:
   # Upstream publishes no tags or releases, so the pin is a commit on main: immutable, unlike a branch.
   RELAY_SHA: d4f34c04396c920a1cded5443e7361a4d94d3010
   IMAGE: ghcr.io/bill-scheffer/bulwark-relay-hardened
-  VERSION: 0.1.0-d4f34c0-h2
+  VERSION: 0.1.0-d4f34c0-h3
 
 jobs:
   build:
@@ -60,6 +62,17 @@ jobs:
           want=$(printf '%s\n' ' M src/server.ts' ' M src/store.ts' ' M src/types.ts' ' M src/validation.test.ts' ' M src/validation.ts' '?? src/store.test.ts' | LC_ALL=C sort | tr '\n' '|')
           [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
 
+      - name: Apply patch 0002 on top, and prove it changed exactly its four files
+        working-directory: relay
+        run: |
+          set -eu
+          git add -A && git -c user.email=ci@example.invalid -c user.name=ci commit -qm "patch 0001"
+          git apply --check ../patch/patches/0002-dedupe-cluster-pushes.patch
+          git apply ../patch/patches/0002-dedupe-cluster-pushes.patch
+          got=$(git status --porcelain | LC_ALL=C sort | tr '\n' '|')
+          want=$(printf '%s\n' ' M src/metrics.ts' ' M src/server.ts' '?? src/dedupe.test.ts' '?? src/dedupe.ts' | LC_ALL=C sort | tr '\n' '|')
+          [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
+
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
         with:
           node-version: "22"
@@ -88,7 +101,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.VERSION }}
-            org.opencontainers.image.description=Bulwark push relay @ ${{ env.RELAY_SHA }}, hardened for public exposure
+            org.opencontainers.image.description=Bulwark push relay @ ${{ env.RELAY_SHA }}, hardened for public exposure, cluster pushes deduplicated
             org.opencontainers.image.licenses=AGPL-3.0-only
 
       - name: Build upstream unpatched, for the negative control only (never pushed)
