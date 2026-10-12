@@ -60,6 +60,21 @@ The workflow runs these steps, and pushes the image only if all of them pass:
 - **Negative control:** the unpatched upstream image, built from the same commit, must accept every
   one of the refused cases, and forwards both copies. So each check can actually fail.
 
+## Publishing and pinning
+
+A pull request runs every step but the registry login and the push. A dispatch from a branch pushes the tested
+image as `branch-<short sha>` only. `main` publishes `VERSION`'s tag, and only once: a tag that already exists is
+never re-pushed, so a change to what is built must bump `VERSION`. The build fails a pull request that changes
+`patches/`, a value in `env:`, a step up to and including the image build, or a repo file such a step names, without
+the bump. Pin the image **by digest**, and the digest you pin keeps its tag (MainThrive MAI-1021).
+
+A digest pinned without a tag of its own is protected by tagging it `pinned-<first 12 hex>`. The workflow copies
+the manifest as-is and never moves a tag:
+
+```bash
+gh workflow run protect-digest.yml -R Bill-Scheffer/bulwark-relay-hardened -f digest=sha256:<64 hex>
+```
+
 ## License
 
 AGPL-3.0-only, as upstream (`LICENSE`). The source for every image is upstream at `RELAY_SHA` plus
