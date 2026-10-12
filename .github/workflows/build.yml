@@ -65,7 +65,7 @@ jobs:
       # already exists is never re-pushed, and a change to what goes into the image must bump VERSION; this fails a
       # pull request that makes one without the bump. What goes in: patches/**, any other file of this repo that a step
       # up to the image build names (patch/<path>), the env: values, and every step up to and including the image build.
-      # Left out, because none can change the image: comments, step names, push:/load:, the registry login and this step.
+      # Left out: comments, step names and this step, none of which can change the image.
       # The package is public, so this reads it without logging in.
       - name: The release tag is new, or already names this content (it is never re-pushed)
         id: release
@@ -85,9 +85,9 @@ jobs:
           inputs_of() {
             git -C patch show "$1:.github/workflows/build.yml" | awk '
               /^env:/ { on = 1 }
-              /^      - / { if (build) exit; skip = /name: The release tag is new/ || /uses: docker\/login-action/ }
-              /uses: docker\/build-push-action/ { build = 1 }
-              on && !skip && !/^[[:space:]]*(#|$)/ && !/^[[:space:]]*(- )?name:/ && !/^[[:space:]]*(push|load):/'
+              /^      - / { if (build) exit; skip = /name: The release tag is new/ }
+              /^[[:space:]]*(- )?uses: docker\/build-push-action/ { build = 1 }
+              on && !skip && !/^[[:space:]]*(#|$)/ && !/^[[:space:]]*(- )?name:/'
           }
           # This repo's files those steps name: patches/** today. A script added before the build is then covered too.
           refs=$(inputs_of HEAD | { grep -oE '(^|[^[:alnum:]_-])patch/[[:alnum:]_./-]+' || true; } | sed -E 's#^[^p]?patch/##' | sort -u)
