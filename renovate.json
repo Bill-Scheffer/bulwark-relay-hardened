@@ -1,0 +1,32 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "description": [
+    "MainThrive MAI-1427. This config exists so that the upstream pin in .github/workflows/build.yml is proposed when upstream moves. Before it nothing did, and MainThrive MAI-1424 found the pin far behind upstream by hand.",
+    "enabledManagers is only the regex manager below, on purpose. This repo's job is one upstream plus our patches; the action SHAs in the workflows are not what this config is for.",
+    "automerge is false and must stay false. A bump means rebasing our patches onto the new upstream and bumping VERSION, and the build refuses a changed input without a VERSION bump. So a proposal is red until a person does that work, and a person reviews it.",
+    "There is no minimumReleaseAge. The git datasources publish no release timestamps, so a soak would hold every release forever (MainThrive MAI-1424 measured that failure on quay.io and ghcr.io).",
+    "Upstream publishes no tags, so the pin is a commit on main (RELAY_SHA). The git-refs datasource follows main and proposes its newest commit."
+  ],
+  "enabledManagers": [
+    "custom.regex"
+  ],
+  "automerge": false,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/build\\.yml$/"
+      ],
+      "matchStrings": [
+        "\\n\\s*RELAY_SHA:\\s*(?<currentDigest>[0-9a-f]{40})"
+      ],
+      "currentValueTemplate": "main",
+      "depNameTemplate": "bulwarkmail/relay",
+      "packageNameTemplate": "https://github.com/bulwarkmail/relay",
+      "datasourceTemplate": "git-refs"
+    }
+  ]
+}
