@@ -1,33 +1,30 @@
 # bulwark-relay-hardened
 
 The [Bulwark push relay](https://github.com/bulwarkmail/relay), built from a pinned upstream commit
-with one patch that makes it safe to expose publicly. Published as
-`ghcr.io/bill-scheffer/bulwark-relay-hardened`. A second patch keeps a clustered mail server from
-notifying every device once per node.
+(`e077c33`, 2026-11-13) with one patch, which keeps a clustered mail server from notifying every device once per
+node. Published as `ghcr.io/bill-scheffer/bulwark-relay-hardened`.
 
 Upstream publishes no image and no tags, so this repo pins a commit (`RELAY_SHA` in
-`.github/workflows/build.yml`) and builds it with upstream's own Dockerfile.
+`.github/workflows/build.yml`) and builds it with upstream's own Dockerfile. The pin was reviewed as a commit:
+`d4f34c0..e077c33` is upstream's November security audit (journal store, a data-directory lock, per-device and
+per-address limits, endpoint guards), followed by two dependency bumps (MainThrive MAI-1442).
 
-## The patch (`patches/0001-harden-for-public-exposure.patch`)
+## Patch 0001, retired at `e077c33`
 
-The relay's endpoints are unauthenticated by design: any browser registers a push subscription. The
-patch adds three things:
+`0001-harden-for-public-exposure.patch` made the relay safe to expose publicly in three ways. Upstream's audit now does
+each, so it was dropped (MainThrive MAI-1442):
 
-1. **Web Push endpoints must be on a known push service.** These are FCM, Mozilla autopush, Apple,
-   and WNS (`*.notify.windows.com`); `WEBPUSH_ALLOWED_HOSTS` overrides the list. Upstream accepts any
-   `https` URL. A caller could register their own URL, then POST to `/api/push/jmap/<their id>` and
-   make the relay send a request to it. That is server-side request forgery from the relay's network.
-2. **Unconfirmed subscriptions are capped and expire.** A subscription is *pending* until the JMAP
-   server first reaches it (its verification, or a push). Pending ones expire after the 10-minute
-   verification window, and at most `MAX_PENDING` (default 1000) exist at once: past that, new ids get
-   503. Upstream rewrites its whole JSON store on every change and has no limit, so registrations
-   alone could grow it until the relay stalls. A flat cap would only trade that for a lockout,
-   because anyone could fill it. With this rule a flood can delay new sign-ups while it lasts, but
-   never evicts or blocks a confirmed subscription. ⚠️ **It holds only if nothing but your own mail
-   server can reach `/api/push/jmap/`**, because anything that can post there can confirm an id. Our
-   deployment restricts that path at the proxy to the mail server's addresses.
-3. **UnifiedPush is off unless `UNIFIEDPUSH_ENABLED=true`.** Its endpoints are arbitrary `https`
-   URLs by design, which is the same forgery risk as 1.
+| 0001 did | Upstream at `e077c33` |
+|---|---|
+| Web Push endpoints only on a known push service, so the relay could not be made to call an arbitrary URL | only `https` on public addresses, a name without a dot or `.local`/`.internal` refused at registration, the address checked again on every connection, no redirect followed, 4 KB of an answer read (README, "Which endpoints it calls"). ⚠️ Weaker in one way: any public `https` host is accepted, not only the push services, so a mail user who registers their own endpoint and points a JMAP push subscription at the relay can make it POST a sealed, size-capped push to a public host of their choosing. It can no longer reach a private network either way |
+| unconfirmed subscriptions capped and expired, so a flood could not fill the store or lock out real devices | `PUSH_MAX_SUBSCRIPTIONS`, a per-address cap and a registration rate limit, and an eviction order that never drops a device that delivered in the last 30 days (README, "Limits"). ⚠️ The per-address cap and rate only work when the relay can tell clients apart (`TRUST_PROXY`); behind a proxy that forwards no client address, only the store cap and its eviction order apply, and a flood of fresh registrations (which may not be evicted for 10 minutes) refuses new devices with `507` while it lasts, as 0001's cap refused them with `503` |
+| UnifiedPush off unless opted in | its endpoints pass the same public-address guard |
+
+⚠️ **What it rests on, unchanged:** the relay calls an endpoint only when `/api/push/jmap/:id` is posted to, and
+MainThrive's proxy admits that path only from the mail server's addresses (MainThrive
+`infra/k8s/mail/tests/check-push-relay-route.sh`). A registration alone never makes the relay call out. `scripts/e2e.sh`
+checks the guard that replaced the allowlist in the image that ships: a private address and a name without a dot are
+refused.
 
 ## Patch 0002: one notification per message from a clustered mail server
 
@@ -37,7 +34,12 @@ push while its node is down. So with two nodes every new message arrived twice. 
 (Bulwark's service worker replaces the notification by tag), and iOS showed both.
 
 `src/dedupe.ts` forwards a push once and answers its identical copies `200 {"duplicate":true}`, so the
-mail server does not retry them. EmailPush copies are identical when they list the same message ids;
+mail server does not retry them. The claim is taken just before upstream's hold (its rate limits, and a
+backoff a push service asked for), with no `await` between the two, so a copy spends none of the hold's tokens; and it
+is given back when the push is held, or its forward fails or throws: a push that went out is the only one its copies are
+dropped for, so the mail server's retry of a held or refused push goes through. `src/dedupe-server.test.ts` proves both
+through the real relay: eight messages sent twice at once all go out (with the claim after the hold, the sixth is held),
+and a held or refused push's retry is forwarded (with the release removed, that case fails). EmailPush copies are identical when they list the same message ids;
 StateChange copies when they carry the same states. A new message is always a new push. The check and
 the claim are synchronous, because the copies arrive milliseconds apart. A failed forward releases
 its claim. A copy that arrived while that forward was in flight has already been dropped, so the
@@ -49,16 +51,14 @@ mail server's retry of the failed push goes through instead: late, not lost. Cla
 
 The workflow runs these steps, and pushes the image only if all of them pass:
 
-- It applies 0001 and checks it changed exactly its six files, then 0002 and its four.
+- It applies 0002, checks it changed exactly its five files, that the claim comes before the hold, and that it is given
+  back when the push is held or its forward fails.
 - It runs upstream's tests plus the patch's, and the typecheck.
-- It builds the image and runs `scripts/e2e.sh` against it. That script registers a push-service
-  endpoint (accepted), an arbitrary URL and a look-alike host (both refused), UnifiedPush (refused),
-  and a third pending id past a cap of 2 (503). It checks a verification round trip, and that
-  a confirmed id no longer counts against the cap. Expiry is covered by a unit test.
-- The e2e then forwards for real: encrypted Web Push to a throwaway push service the relay trusts.
-  Two copies of one delivery, posted concurrently, reach it once, and the next message reaches it.
-- **Negative control:** the unpatched upstream image, built from the same commit, must accept every
-  one of the refused cases, and forwards both copies. So each check can actually fail.
+- It builds the image and runs `scripts/e2e.sh` against it: a push-service endpoint registers, a private address and a
+  name without a dot are refused (upstream's guard, which 0001's allowlist was replaced by), and then, forwarding for
+  real with encrypted Web Push to a throwaway push service, two copies of one delivery posted concurrently reach it
+  once, and the next message reaches it.
+- **Negative control:** the unpatched upstream image, built from the same commit, forwards both copies.
 
 ## Publishing and pinning
 
