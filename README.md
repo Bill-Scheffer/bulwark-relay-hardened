@@ -1,8 +1,8 @@
 # bulwark-relay-hardened
 
 The [Bulwark push relay](https://github.com/bulwarkmail/relay), built from a pinned upstream commit
-(`e077c33`, 2026-11-13) with one patch, which keeps a clustered mail server from notifying every device once per
-node. Published as `ghcr.io/bill-scheffer/bulwark-relay-hardened`.
+(`e077c33`, 2026-11-13) with two patches: one keeps a clustered mail server from notifying every device once per
+node, and one sends every push at high urgency with no Topic, as the relay did before `e077c33`. Published as `ghcr.io/bill-scheffer/bulwark-relay-hardened`.
 
 Upstream publishes no image and no tags, so this repo pins a commit (`RELAY_SHA` in
 `.github/workflows/build.yml`) and builds it with upstream's own Dockerfile. The pin was reviewed as a commit:
@@ -47,18 +47,37 @@ mail server's retry of the failed push goes through instead: late, not lost. Cla
 `DEDUPE_TTL_MS` (10 minutes), and at most `DEDUPE_MAX_KEYS` (10,000) are held, oldest dropped first.
 `relay_pushes_deduplicated_total` counts the dropped copies.
 
+## Patch 0003: every push at high urgency, with no Topic
+
+`e077c33` decides each push's delivery headers (upstream `7c84025`, `2aea6e6`): `high` urgency and a Topic (an
+RFC 8030 replacement key, FCM's collapse key) for a push it reads as new mail, `normal` for one that only names
+`Email`, and `low` for the rest. The relay before it sent every push at `high`, with no Topic and the same one-hour
+TTL. Once MainThrive ran `e077c33`, a user's two Android phones showed no notification for new mail while their iPhone
+did. The relay had forwarded every push, and the push service had accepted each one (MainThrive MAI-1442). An Android phone may hold
+a push below `high` urgency until it next wakes.
+
+`src/forward-policy.ts`'s `deliveryOptions` now returns `{ urgency: 'high' }` for every push, whatever the push
+says and whatever urgency the mail server asked for. Web Push and UnifiedPush are the transports that send an urgency; the native FCM and APNs paths take none.
+Upstream's own tests of the old behaviour are replaced in `src/server.test.ts` by two that pin the new one, and both
+fail on unpatched `e077c33`. What it costs: a device that was offline gets every queued ping, not only the latest
+new-mail one, and a ping that is only a read flag wakes the phone as new mail does.
+
 ## How a build is proven
 
 The workflow runs these steps, and pushes the image only if all of them pass:
 
 - It applies 0002, checks it changed exactly its five files, that the claim comes before the hold, and that it is given
   back when the push is held or its forward fails.
-- It runs upstream's tests plus the patch's, and the typecheck.
+- It applies 0003, checks it changed exactly `src/forward-policy.ts` and `src/server.test.ts`, and that
+  `deliveryOptions` returns high urgency.
+- It runs upstream's tests plus the patches', and the typecheck.
 - It builds the image and runs `scripts/e2e.sh` against it: a push-service endpoint registers, a private address and a
   name without a dot are refused (upstream's guard, which 0001's allowlist was replaced by), and then, forwarding for
   real with encrypted Web Push to a throwaway push service, two copies of one delivery posted concurrently reach it
-  once, and the next message reaches it.
-- **Negative control:** the unpatched upstream image, built from the same commit, forwards both copies.
+  once, and the next message reaches it. The push service also records each push's `Urgency`, `Topic` and `TTL`:
+  every push the patched image sends, two new messages and two state changes, reads `high`, no Topic, `3600`.
+- **Negative control:** the unpatched upstream image, built from the same commit, forwards both copies, and sends a
+  ping that names only a mailbox at `low` urgency.
 
 ## Publishing and pinning
 

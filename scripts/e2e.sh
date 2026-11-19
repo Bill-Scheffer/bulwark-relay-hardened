@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end proof against the BUILT image, for patch 0002: a clustered mail server's identical pushes
+# End-to-end proof against the BUILT image, for patches 0002 and 0003: a clustered mail server's identical pushes
 # reach the device once, forwarded for real to a throwaway push service, with a negative control
 # (upstream, unpatched) that forwards both copies. First, the upstream guard this deployment relies on
 # since 0001 was retired is checked in the image that ships: a private push endpoint is refused.
@@ -70,7 +70,10 @@ chmod 755 "$WORK"; chmod a+r "$WORK"/*
 docker run -d --name e2e-push --network e2e-net --user root -v "$WORK:/tls:ro" --entrypoint node "$IMAGE" -e '
   const fs = require("fs");
   require("https").createServer({ key: fs.readFileSync("/tls/push.key"), cert: fs.readFileSync("/tls/push.pem") },
-    (req, res) => { req.resume(); req.on("end", () => { console.log("PUSH " + req.url); res.writeHead(201); res.end(); }); }
+    (req, res) => { req.resume(); req.on("end", () => {
+      console.log("PUSH " + req.url);
+      console.log("HDR " + req.url + " urgency=" + (req.headers.urgency || "-") + " topic=" + (req.headers.topic || "-") + " ttl=" + (req.headers.ttl || "-"));
+      res.writeHead(201); res.end(); }); }
   ).listen(443);' >/dev/null
 pushes() { docker logs e2e-push 2>&1 | grep -c '^PUSH /dd-'"$1"'$' || true; }
 # A real P-256 key and auth secret, so the relay can encrypt the payload.
@@ -113,5 +116,25 @@ got=$(ddcase e2e-dd-up "$UPSTREAM" e2e-dd-B1)
 case "$got" in
   3\ *) echo "ok   control: upstream forwards both copies -> $got" ;;
   *) echo "::error::control: upstream should forward both copies and the next message (3 pushes), got $got"; exit 1 ;;
+esac
+echo "== every push at high urgency, with no Topic (patch 0003)"
+# A new message as a state change, and a ping that names only a mailbox: upstream sends the second at low urgency,
+# and the first under a Topic. The headers are read off the throwaway push service.
+headers() { docker logs e2e-push 2>&1 | grep -E '^HDR /dd-'"$1"' ' | sed -E 's/^HDR [^ ]+ //' | sort | uniq -c | sed -E 's/^ +//' | paste -sd'|' -; }
+for body in '{"@type":"StateChange","changed":{"a1":{"EmailDelivery":"s10"}}}' '{"@type":"StateChange","changed":{"a1":{"Mailbox":"s11"}}}'; do
+  expect "patched: a state change forwarded" "200" "$(call e2e-dd POST /api/push/jmap/e2e-dd-A1 "$body")"
+done
+expect "control: a mailbox-only ping forwarded" "200" "$(call e2e-dd-up POST /api/push/jmap/e2e-dd-B1 '{"@type":"StateChange","changed":{"a1":{"Mailbox":"s11"}}}')"
+sleep 1
+got=$(headers e2e-dd-A1)
+case "$got" in
+  # Two EmailPush messages above, and the two state changes: four pushes, one set of headers.
+  "4 urgency=high topic=- ttl=3600") echo "ok   patched: every push high, no Topic, TTL 3600 -> $got" ;;
+  *) echo "::error::patched: want 4 pushes, all 'urgency=high topic=- ttl=3600', got $got"; exit 1 ;;
+esac
+got=$(headers e2e-dd-B1)
+case "$got" in
+  *"urgency=low topic=- ttl=3600"*) echo "ok   control: upstream sends the mailbox ping at low urgency -> $got" ;;
+  *) echo "::error::control: upstream should send the mailbox-only ping at low urgency, got $got"; exit 1 ;;
 esac
 echo "e2e: OK"

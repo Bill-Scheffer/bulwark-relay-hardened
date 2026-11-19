@@ -1,6 +1,7 @@
-# Builds the Bulwark push relay from its upstream source, pinned by commit, with ONE change.
+# Builds the Bulwark push relay from its upstream source, pinned by commit, with TWO changes.
 # patches/0002-dedupe-cluster-pushes.patch: a clustered mail server sends each push from every node,
-# so the relay forwards one and drops the identical copies. 0001 (hardening for public exposure) was
+# so the relay forwards one and drops the identical copies. patches/0003-always-urgency-high.patch: every push goes
+# at high urgency with no Topic, as before e077c33 (README, "Patch 0003"; MainThrive MAI-1442). 0001 (hardening for public exposure) was
 # retired at upstream e077c33, whose own security series covers it (README, "Patch 0001, retired";
 # MainThrive MAI-1442). Everything else is upstream, including its Dockerfile. The
 # image is pushed only after an end-to-end check against the built image passes, with the unpatched
@@ -33,7 +34,7 @@ env:
   # Upstream publishes no tags or releases, so the pin is a commit on main: immutable, unlike a branch.
   RELAY_SHA: e077c33fb158b10cac02a9a6803b701ebb8ea43c
   IMAGE: ghcr.io/bill-scheffer/bulwark-relay-hardened
-  VERSION: 0.1.0-e077c33-h4
+  VERSION: 0.1.0-e077c33-h5
 
 jobs:
   build:
@@ -115,6 +116,19 @@ jobs:
             && grep -A1 -F 'if (hold) {' src/server.ts | grep -qF 'if (key !== null) recentPushes.release(key);' \
             || { echo "::error::the duplicate claim is not taken before the hold, or not given back when held or failed"; exit 1; }
 
+      - name: Apply patch 0003, and prove it changed exactly its two files
+        working-directory: relay
+        run: |
+          set -eu
+          before=$(git status --porcelain | LC_ALL=C sort)
+          git apply --check ../patch/patches/0003-always-urgency-high.patch
+          git apply ../patch/patches/0003-always-urgency-high.patch
+          got=$(git status --porcelain | LC_ALL=C sort | tr '\n' '|')
+          want=$(printf '%s\n' "$before" ' M src/forward-policy.ts' ' M src/server.test.ts' | LC_ALL=C sort | tr '\n' '|')
+          [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
+          grep -qF "return { urgency: 'high' };" src/forward-policy.ts \
+            || { echo "::error::deliveryOptions does not send every push at high urgency"; exit 1; }
+
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
         with:
           node-version: "22"
@@ -143,7 +157,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.VERSION }}
-            org.opencontainers.image.description=Bulwark push relay @ ${{ env.RELAY_SHA }}, cluster pushes deduplicated
+            org.opencontainers.image.description=Bulwark push relay @ ${{ env.RELAY_SHA }}, cluster pushes deduplicated, every push at high urgency
             org.opencontainers.image.licenses=AGPL-3.0-only
 
       - name: Build upstream unpatched, for the negative control only (never pushed)
