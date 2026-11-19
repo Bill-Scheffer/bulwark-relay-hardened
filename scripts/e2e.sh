@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# End-to-end proof against the BUILT image: the hardening holds in the image that ships, and a
-# negative control (upstream, unpatched) shows each check can actually fail. The last section
-# forwards for real, to a throwaway push service, to prove a clustered mail server's identical
-# pushes reach the device once (patch 0002).
+# End-to-end proof against the BUILT image, for patch 0002: a clustered mail server's identical pushes
+# reach the device once, forwarded for real to a throwaway push service, with a negative control
+# (upstream, unpatched) that forwards both copies. First, the upstream guard this deployment relies on
+# since 0001 was retired is checked in the image that ships: a private push endpoint is refused.
 #   usage: e2e.sh <patched image> <upstream image>
 set -euo pipefail
 IMAGE="$1"
@@ -26,7 +26,7 @@ start() { # name image extra-env...
   docker run -d --name "$name" -e VAPID_PUBLIC_KEY="$PUB" -e VAPID_PRIVATE_KEY="$PRIV" \
     -e VAPID_SUBJECT=mailto:e2e@example.test "$@" "$image" >/dev/null
   for _ in $(seq 1 30); do
-    docker exec "$name" wget -q -O /dev/null http://127.0.0.1:3003/api/health 2>/dev/null && return 0
+    docker exec "$name" node -e 'fetch("http://127.0.0.1:3003/api/health").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))' 2>/dev/null && return 0
     sleep 1
   done
   docker logs "$name" | tail -20; echo "::error::$name did not become healthy"; exit 1
@@ -48,25 +48,13 @@ web() { # id endpoint
 }
 
 echo "== patched: $IMAGE"
-start e2e-relay "$IMAGE" -e MAX_PENDING=2
-expect "vapid key served"              "200"  "$(call e2e-relay GET /api/push/vapid-public-key)"
-expect "a push-service endpoint"       "200"  "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-A1 https://fcm.googleapis.com/fcm/send/abc)")"
-expect "an arbitrary endpoint (SSRF)"  "400"  "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-X1 https://attacker.example/collect)")"
-expect "a look-alike host"             "400"  "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-X2 https://fcm.googleapis.com.attacker.example/x)")"
-expect "UnifiedPush, not opted in"     "403"  "$(call e2e-relay POST /api/push/register/unifiedpush '{"subscriptionId":"e2e-sub-U1","endpoint":"https://attacker.example/up"}')"
-expect "second pending id (cap of 2)"  "200"  "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-B1 https://updates.push.services.mozilla.com/wpush/v2/x)")"
-expect "third pending id, past the cap" "503" "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-C1 https://web.push.apple.com/x)")"
-expect "an existing id re-registers"   "200"  "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-A1 https://fcm.googleapis.com/fcm/send/abc)")"
-expect "PushVerification accepted"     "200"  "$(call e2e-relay POST /api/push/jmap/e2e-sub-A1 '{"@type":"PushVerification","pushSubscriptionId":"p","verificationCode":"e2e-code-7"}')"
-expect "verify returns the code"       '200 {"verificationCode":"e2e-code-7"}' "$(call e2e-relay GET /api/push/verify/e2e-sub-A1)"
-expect "confirmed ids leave the cap"   "200"  "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-C1 https://web.push.apple.com/x)")"
+start e2e-relay "$IMAGE"
+expect "vapid key served"                  "200" "$(call e2e-relay GET /api/push/vapid-public-key)"
+expect "a push-service endpoint"           "200" "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-A1 https://fcm.googleapis.com/fcm/send/abc)")"
+# Upstream's guard, which replaced 0001's allowlist: the relay never calls into a private network.
+expect "a private endpoint (SSRF), refused" "400" "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-X1 https://10.0.0.1/collect)")"
+expect "a name without a dot, refused"     "400" "$(call e2e-relay POST /api/push/register/web "$(web e2e-sub-X2 https://internal/collect)")"
 
-echo "== negative control, upstream unpatched: $UPSTREAM"
-start e2e-upstream "$UPSTREAM" -e MAX_PENDING=2
-expect "control: arbitrary endpoint accepted" "200" "$(call e2e-upstream POST /api/push/register/web "$(web e2e-sub-X1 https://attacker.example/collect)")"
-expect "control: UnifiedPush accepted"        "200" "$(call e2e-upstream POST /api/push/register/unifiedpush '{"subscriptionId":"e2e-sub-U1","endpoint":"https://attacker.example/up"}')"
-expect "control: no cap (id 2)"               "200" "$(call e2e-upstream POST /api/push/register/web "$(web e2e-sub-B1 https://updates.push.services.mozilla.com/wpush/v2/x)")"
-expect "control: no cap (id 3)"               "200" "$(call e2e-upstream POST /api/push/register/web "$(web e2e-sub-C1 https://web.push.apple.com/x)")"
 echo "== duplicate pushes from a cluster reach the device once (patch 0002)"
 # A throwaway push service at https://e2e-push, with a CA the relays trust, that logs one line per
 # push it receives. The relays send real, encrypted Web Push to it, so this is the forward that
@@ -107,7 +95,7 @@ burst() { # name id
     })();'
 }
 ddcase() { # name image id -> "<pushes after the two copies> <pushes after the next message>"
-  start "$1" "$2" --network e2e-net -v "$WORK:/tls:ro" -e NODE_EXTRA_CA_CERTS=/tls/ca.pem -e WEBPUSH_ALLOWED_HOSTS=e2e-push
+  start "$1" "$2" --network e2e-net -v "$WORK:/tls:ro" -e NODE_EXTRA_CA_CERTS=/tls/ca.pem -e PUSH_ALLOW_PRIVATE_ENDPOINTS=e2e-push
   expect "$1: register a real subscription" "200" "$(call "$1" POST /api/push/register/web "$(realweb "$3" "dd-$3")")" >&2
   expect "$1: confirm it"                   "200" "$(call "$1" POST "/api/push/jmap/$3" '{"@type":"PushVerification","pushSubscriptionId":"p","verificationCode":"c"}')" >&2
   burst "$1" "$3" > "$WORK/$3.out"

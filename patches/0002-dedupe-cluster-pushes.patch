@@ -1,3 +1,90 @@
+diff --git a/src/dedupe-server.test.ts b/src/dedupe-server.test.ts
+new file mode 100644
+index 0000000..872b448
+--- /dev/null
++++ b/src/dedupe-server.test.ts
+@@ -0,0 +1,81 @@
++// MainThrive (patch 0002), through the real relay: a clustered mail server's copies of one push reach the push
++// service once, and a push the relay did not forward (held back, or refused by the push service) leaves no claim
++// behind, so the mail server's retry of it goes through instead of being taken for its own copy.
++import assert from 'node:assert/strict';
++import { after, before, describe, it } from 'node:test';
++import {
++  emailPush,
++  makeDevice,
++  newId,
++  postJson,
++  startFakePushService,
++  startRelay,
++  type FakePushService,
++  type RunningRelay,
++} from './test-support/harness.js';
++
++let service: FakePushService;
++let relay: RunningRelay;
++
++before(async () => {
++  service = await startFakePushService();
++  relay = await startRelay();
++});
++
++after(async () => {
++  await relay.stop();
++  await service.close();
++});
++
++async function registerWeb(pathname: string): Promise<string> {
++  const id = newId();
++  const res = await postJson(relay.base, '/api/push/register/web', {
++    subscriptionId: id,
++    subscription: { endpoint: service.url(pathname), keys: makeDevice().keys },
++    accountLabel: 'alice@example.org',
++  });
++  assert.equal(res.status, 200);
++  return id;
++}
++
++describe('one push per message from a clustered mail server', () => {
++  it('forwards two concurrent copies once, and the next message again', async () => {
++    const id = await registerWeb('/dedupe-copies');
++    const [a, b] = await Promise.all([
++      postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e1'])),
++      postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e1'])),
++    ]);
++    assert.deepEqual([a.status, b.status], [200, 200]);
++    assert.equal([a.body, b.body].filter((body) => body.duplicate === true).length, 1);
++    assert.equal(service.to('/dedupe-copies').length, 1);
++    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e2']))).status, 200);
++    assert.equal(service.to('/dedupe-copies').length, 2);
++  });
++
++  it('leaves no claim for a push the push service refused, so its retry is forwarded', async () => {
++    const id = await registerWeb('/dedupe-refused');
++    service.answer('/dedupe-refused', { status: 500 });
++    const first = await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['r1']));
++    assert.notEqual(first.body.duplicate, true);
++    service.answer('/dedupe-refused', { status: 201 });
++    const retry = await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['r1']));
++    assert.equal(retry.status, 200);
++    assert.notEqual(retry.body.duplicate, true, 'the retry of a refused push was dropped as a copy');
++    assert.equal(service.to('/dedupe-refused').length, 2);
++  });
++
++  it('leaves no claim for a push held back, so its retry is forwarded once the hold ends', async () => {
++    const id = await registerWeb('/dedupe-held');
++    // The push service asks for a backoff; the relay then holds the next push for that endpoint.
++    service.answer('/dedupe-held', { status: 429, headers: { 'retry-after': '1' } });
++    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['h0']))).status, 503);
++    service.answer('/dedupe-held', { status: 201 });
++    const held = await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['h1']));
++    assert.equal(held.status, 503);
++    assert.equal(held.body.held, 'push-service-backoff');
++    await new Promise((resolve) => setTimeout(resolve, 1500));
++    const retry = await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['h1']));
++    assert.equal(retry.status, 200);
++    assert.notEqual(retry.body.duplicate, true, 'the retry of a held push was dropped as a copy');
++  });
++});
 diff --git a/src/dedupe.test.ts b/src/dedupe.test.ts
 new file mode 100644
 index 0000000..5804bc9
@@ -134,10 +221,10 @@ index 0000000..39b66b9
 +
 +export const recentPushes = new RecentPushes();
 diff --git a/src/metrics.ts b/src/metrics.ts
-index 24aa548..78fe9ce 100644
+index e043b44..ac525a2 100644
 --- a/src/metrics.ts
 +++ b/src/metrics.ts
-@@ -52,6 +52,13 @@ export const pushesReceived = new Counter({
+@@ -83,6 +83,13 @@ export const pushesReceived = new Counter({
    registers: [registry],
  });
  
@@ -150,40 +237,54 @@ index 24aa548..78fe9ce 100644
 +
  export const pushesForwarded = new Counter({
    name: 'relay_pushes_forwarded_total',
-   help: 'Push forwarding outcomes by transport',
+   help: 'Push forwarding outcomes by transport and push service HTTP status ("none" = no response)',
 diff --git a/src/server.ts b/src/server.ts
-index 58367c8..401d362 100644
+index b9836ec..43c0583 100644
 --- a/src/server.ts
 +++ b/src/server.ts
-@@ -6,6 +6,7 @@ import { sendFcmPush } from './fcm.js';
+@@ -7,6 +7,7 @@ import { getApnsConfig, sendApnsPush } from './apns.js';
  import { getVapidPublicKey, sendWebPush } from './webpush.js';
  import { sendUnifiedPush } from './unifiedpush.js';
- import { isForwardableBody, toForwardPayload } from './payload.js';
+ import { isForwardableBody, subOf, toForwardPayload } from './payload.js';
 +import { pushKey, recentPushes } from './dedupe.js';
+ import { deliveryOptions, forwardPolicy, type DeliveryOptions } from './forward-policy.js';
+ import { clientKey, takeRegistration } from './client-limit.js';
  import {
-   isValidFcmToken,
-   isValidSubscriptionId,
-@@ -30,6 +31,7 @@ import {
+@@ -56,6 +57,7 @@ import {
    subscriptionsActive,
    pushesReceived,
    pushesForwarded,
 +  pushesDeduplicated,
+   pushesHeld,
    fcmDurationSeconds,
-   webPushDurationSeconds,
-   upDurationSeconds,
-@@ -383,7 +385,15 @@ async function handleJmap(
-   // messages that passed - both become the same content-blind device payload.
-   if (isForwardableBody(body)) {
-     pushesReceived.inc({ type: body['@type'] });
-+    // Every node of a clustered mail server sends this same push (dedupe.ts).
-+    // Answer the copies 200 so the server does not retry them.
+   apnsDurationSeconds,
+@@ -640,6 +642,15 @@ async function handleJmap(
+       const ours = hold.reason === 'rate-limit' || hold.reason === 'endpoint-rate-limit';
+       return sendJson(res, ours ? 429 : 503, { ok: false, held: hold.reason });
+     }
++    // MainThrive (patch 0002): every node of a clustered mail server sends this same
++    // push (dedupe.ts). Answer the copies 200 so the server does not retry them.
++    // Claimed only once the push is not held, and released when the forward fails,
++    // so a push the mail server has to send again is never taken for its own copy.
 +    const key = pushKey(id, body);
 +    if (key !== null && !recentPushes.claim(key)) {
 +      pushesDeduplicated.inc({ type: body['@type'] });
 +      return sendJson(res, 200, { ok: true, duplicate: true });
 +    }
-     const result = await dispatch(record, toForwardPayload(body, record.accountLabel));
+     let result: SendResult;
+     try {
+       result = await dispatch(
+@@ -651,11 +662,13 @@ async function handleJmap(
+       // FCM token minting and sending throw on network errors. Count and log
+       // them like any other failed forward, then answer 500 as before so the
+       // JMAP server may retry.
++      if (key !== null) recentPushes.release(key);
+       const failed = { ok: false, status: 0, unregistered: false, reason: failureReason(error) };
+       pushesForwarded.inc({ result: 'fail', transport: record.kind, status: 'none' });
+       logForwardFailure(id, record, 'fail', failed);
+       return sendJson(res, 500, { error: 'Internal server error' });
+     }
 +    if (!result.ok && key !== null) recentPushes.release(key);
-     let outcome: 'ok' | 'unregistered' | 'http-4xx' | 'http-5xx' | 'fail';
-     if (result.unregistered) outcome = 'unregistered';
-     else if (result.ok) outcome = 'ok';
+     // A record replaced meanwhile points at another endpoint, which this says nothing about.
+     if (await subscriptionStore.isCurrent(id, record)) forwardPolicy.note(record, result, subscriptionStore.addressOf(id));
+     const outcome = classifyForward(result);
