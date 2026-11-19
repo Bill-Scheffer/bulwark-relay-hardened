@@ -108,10 +108,12 @@ jobs:
           got=$(git status --porcelain | LC_ALL=C sort | tr '\n' '|')
           want=$(printf '%s\n' ' M src/metrics.ts' ' M src/server.ts' '?? src/dedupe-server.test.ts' '?? src/dedupe.test.ts' '?? src/dedupe.ts' | LC_ALL=C sort | tr '\n' '|')
           [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
-          # The claim comes after upstream's hold and is released on a failed forward (dedupe-server.test.ts proves why).
+          # The claim comes just before upstream's hold, so a copy spends none of its tokens, and is given back when the
+          # push is held or its forward fails (dedupe-server.test.ts proves why).
           grep -qF 'if (!result.ok && key !== null) recentPushes.release(key);' src/server.ts \
-            && [ "$(grep -n 'const hold = forwardPolicy.hold(id, record);' src/server.ts | cut -d: -f1)" -lt "$(grep -n 'const key = pushKey(id, body);' src/server.ts | cut -d: -f1)" ] \
-            || { echo "::error::the duplicate claim is taken before the hold, or never released"; exit 1; }
+            && [ "$(grep -n 'const key = pushKey(id, body);' src/server.ts | cut -d: -f1)" -lt "$(grep -n 'const hold = forwardPolicy.hold(id, record);' src/server.ts | cut -d: -f1)" ] \
+            && grep -A1 -F 'if (hold) {' src/server.ts | grep -qF 'if (key !== null) recentPushes.release(key);' \
+            || { echo "::error::the duplicate claim is not taken before the hold, or not given back when held or failed"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
         with:

@@ -16,8 +16,8 @@ each, so it was dropped (MainThrive MAI-1442):
 
 | 0001 did | Upstream at `e077c33` |
 |---|---|
-| Web Push endpoints only on a known push service, so the relay could not be made to call an arbitrary URL | only `https` on public addresses, a name without a dot or `.local`/`.internal` refused at registration, the address checked again on every connection, no redirect followed, 4 KB of an answer read (README, "Which endpoints it calls") |
-| unconfirmed subscriptions capped and expired, so a flood could not fill the store or lock out real devices | `PUSH_MAX_SUBSCRIPTIONS`, a per-address cap and a registration rate limit, and an eviction order that never drops a device that delivered in the last 30 days (README, "Limits") |
+| Web Push endpoints only on a known push service, so the relay could not be made to call an arbitrary URL | only `https` on public addresses, a name without a dot or `.local`/`.internal` refused at registration, the address checked again on every connection, no redirect followed, 4 KB of an answer read (README, "Which endpoints it calls"). ⚠️ Weaker in one way: any public `https` host is accepted, not only the push services, so a mail user who registers their own endpoint and points a JMAP push subscription at the relay can make it POST a sealed, size-capped push to a public host of their choosing. It can no longer reach a private network either way |
+| unconfirmed subscriptions capped and expired, so a flood could not fill the store or lock out real devices | `PUSH_MAX_SUBSCRIPTIONS`, a per-address cap and a registration rate limit, and an eviction order that never drops a device that delivered in the last 30 days (README, "Limits"). ⚠️ The per-address cap and rate only work when the relay can tell clients apart (`TRUST_PROXY`); behind a proxy that forwards no client address, only the store cap and its eviction order apply, and a flood of fresh registrations (which may not be evicted for 10 minutes) refuses new devices with `507` while it lasts, as 0001's cap refused them with `503` |
 | UnifiedPush off unless opted in | its endpoints pass the same public-address guard |
 
 ⚠️ **What it rests on, unchanged:** the relay calls an endpoint only when `/api/push/jmap/:id` is posted to, and
@@ -34,11 +34,12 @@ push while its node is down. So with two nodes every new message arrived twice. 
 (Bulwark's service worker replaces the notification by tag), and iOS showed both.
 
 `src/dedupe.ts` forwards a push once and answers its identical copies `200 {"duplicate":true}`, so the
-mail server does not retry them. The claim is taken only once upstream's hold (its rate limits, and a
-backoff a push service asked for) has let the push through, and given back when the forward fails or throws: a push
-that went out is the only one its copies are dropped for, so the mail server's retry of a held or refused push goes
-through (`src/dedupe-server.test.ts`, through the real relay; with the claim moved before the hold, or the release
-removed, its case fails). EmailPush copies are identical when they list the same message ids;
+mail server does not retry them. The claim is taken just before upstream's hold (its rate limits, and a
+backoff a push service asked for), with no `await` between the two, so a copy spends none of the hold's tokens; and it
+is given back when the push is held, or its forward fails or throws: a push that went out is the only one its copies are
+dropped for, so the mail server's retry of a held or refused push goes through. `src/dedupe-server.test.ts` proves both
+through the real relay: eight messages sent twice at once all go out (with the claim after the hold, the sixth is held),
+and a held or refused push's retry is forwarded (with the release removed, that case fails). EmailPush copies are identical when they list the same message ids;
 StateChange copies when they carry the same states. A new message is always a new push. The check and
 the claim are synchronous, because the copies arrive milliseconds apart. A failed forward releases
 its claim. A copy that arrived while that forward was in flight has already been dropped, so the
@@ -50,7 +51,8 @@ mail server's retry of the failed push goes through instead: late, not lost. Cla
 
 The workflow runs these steps, and pushes the image only if all of them pass:
 
-- It applies 0002, checks it changed exactly its five files, and that the claim comes after the hold and is released.
+- It applies 0002, checks it changed exactly its five files, that the claim comes before the hold, and that it is given
+  back when the push is held or its forward fails.
 - It runs upstream's tests plus the patch's, and the typecheck.
 - It builds the image and runs `scripts/e2e.sh` against it: a push-service endpoint registers, a private address and a
   name without a dot are refused (upstream's guard, which 0001's allowlist was replaced by), and then, forwarding for

@@ -1,9 +1,9 @@
 diff --git a/src/dedupe-server.test.ts b/src/dedupe-server.test.ts
 new file mode 100644
-index 0000000..872b448
+index 0000000..95465b8
 --- /dev/null
 +++ b/src/dedupe-server.test.ts
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,95 @@
 +// MainThrive (patch 0002), through the real relay: a clustered mail server's copies of one push reach the push
 +// service once, and a push the relay did not forward (held back, or refused by the push service) leaves no claim
 +// behind, so the mail server's retry of it goes through instead of being taken for its own copy.
@@ -56,6 +56,20 @@ index 0000000..872b448
 +    assert.equal(service.to('/dedupe-copies').length, 1);
 +    assert.equal((await postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', ['e2']))).status, 200);
 +    assert.equal(service.to('/dedupe-copies').length, 2);
++  });
++
++  it('spends no rate-limit token on a copy: eight messages, each sent by two nodes at once, all go out', async () => {
++    const id = await registerWeb('/dedupe-budget');
++    // A subscription gets 10 pushes at once (upstream's burst). Copies that counted would spend two per message,
++    // and the sixth message would be held back.
++    for (let i = 0; i < 8; i++) {
++      const pair = await Promise.all([
++        postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', [`b${i}`])),
++        postJson(relay.base, `/api/push/jmap/${id}`, emailPush('a', [`b${i}`])),
++      ]);
++      assert.deepEqual(pair.map((r) => r.status), [200, 200], `message ${i}: ${JSON.stringify(pair.map((r) => r.body))}`);
++    }
++    assert.equal(service.to('/dedupe-budget').length, 8);
 +  });
 +
 +  it('leaves no claim for a push the push service refused, so its retry is forwarded', async () => {
@@ -239,7 +253,7 @@ index e043b44..ac525a2 100644
    name: 'relay_pushes_forwarded_total',
    help: 'Push forwarding outcomes by transport and push service HTTP status ("none" = no response)',
 diff --git a/src/server.ts b/src/server.ts
-index b9836ec..43c0583 100644
+index b9836ec..9954865 100644
 --- a/src/server.ts
 +++ b/src/server.ts
 @@ -7,6 +7,7 @@ import { getApnsConfig, sendApnsPush } from './apns.js';
@@ -258,23 +272,28 @@ index b9836ec..43c0583 100644
    pushesHeld,
    fcmDurationSeconds,
    apnsDurationSeconds,
-@@ -640,6 +642,15 @@ async function handleJmap(
-       const ours = hold.reason === 'rate-limit' || hold.reason === 'endpoint-rate-limit';
-       return sendJson(res, ours ? 429 : 503, { ok: false, held: hold.reason });
-     }
+@@ -631,8 +633,20 @@ async function handleJmap(
+   // messages that passed - both become the same content-blind device payload.
+   if (isForwardableBody(body)) {
+     pushesReceived.inc({ type: body['@type'] });
 +    // MainThrive (patch 0002): every node of a clustered mail server sends this same
 +    // push (dedupe.ts). Answer the copies 200 so the server does not retry them.
-+    // Claimed only once the push is not held, and released when the forward fails,
-+    // so a push the mail server has to send again is never taken for its own copy.
++    // Claimed BEFORE the hold, with no await between the two, so a copy never takes a
++    // token from the rate limits the hold counts; and given back when the push is held
++    // or its forward fails, so a push the mail server has to send again is never taken
++    // for its own copy.
 +    const key = pushKey(id, body);
 +    if (key !== null && !recentPushes.claim(key)) {
 +      pushesDeduplicated.inc({ type: body['@type'] });
 +      return sendJson(res, 200, { ok: true, duplicate: true });
 +    }
-     let result: SendResult;
-     try {
-       result = await dispatch(
-@@ -651,11 +662,13 @@ async function handleJmap(
+     const hold = forwardPolicy.hold(id, record);
+     if (hold) {
++      if (key !== null) recentPushes.release(key);
+       pushesHeld.inc({ reason: hold.reason, transport: record.kind });
+       logger.info('relay: push held back', { subscription: logRef(id), transport: record.kind, ...hold });
+       res.setHeader('retry-after', String(hold.retryAfterSeconds));
+@@ -651,11 +665,13 @@ async function handleJmap(
        // FCM token minting and sending throw on network errors. Count and log
        // them like any other failed forward, then answer 500 as before so the
        // JMAP server may retry.
