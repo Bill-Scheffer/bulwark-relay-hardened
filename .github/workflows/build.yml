@@ -32,7 +32,7 @@ concurrency:
 
 env:
   # Upstream publishes no tags or releases, so the pin is a commit on main: immutable, unlike a branch.
-  RELAY_SHA: e077c33fb158b10cac02a9a6803b701ebb8ea43c
+  RELAY_SHA: c41fa2e7ea7dd9169ec56d4b21ff255e685450c8
   IMAGE: ghcr.io/bill-scheffer/bulwark-relay-hardened
   VERSION: 0.1.0-e077c33-h5
 
